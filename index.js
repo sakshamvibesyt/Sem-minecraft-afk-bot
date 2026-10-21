@@ -1,588 +1,334 @@
+'use strict';
 
-const express = require("express");
-const mineflayer = require("mineflayer");
-const TelegramBot = require("node-telegram-bot-api");
+const express = require('express');
+const mineflayer = require('mineflayer');
+const TelegramBot = require('node-telegram-bot-api');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 
-const {
-  pathfinder,
-  Movements,
-  goals: { GoalBlock }
-} = require("mineflayer-pathfinder");
-
-const app = express();
-const PORT = Number(process.env.PORT || 10000);
-
+// ---------- ENVIRONMENT ----------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_CHAT_ID;
+const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || '').trim();
+const PORT = Number(process.env.PORT || 3000);
 
-const sessions = new Map();
+// Render Web Service health endpoint
+const app = express();
+app.get('/', (_req, res) => res.status(200).send('SEM-AFK-BOT is running.'));
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'SEM-AFK-BOT',
+    serversConfigured: serverConfigs.size,
+    connectedBots: [...sessions.values()].filter(s => s.bot && s.bot.entity).length
+  });
+});
+const httpServer = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`HTTP health server listening on port ${PORT}`);
+});
+
+// ---------- STATE ----------
 const serverConfigs = new Map();
-
+const sessions = new Map();
 let telegram = null;
 let shuttingDown = false;
 
-// ---------- HTTP WEB SERVICE ----------
-
-app.get("/", (req, res) => {
-  res.status(200).send("SEM AFK BOT is running.");
-});
-
-app.get("/health", (req, res) => {
-  const servers = {};
-
-  for (const [id, session] of sessions) {
-    servers[id] = {
-      connected: Boolean(session.bot?.entity),
-      connecting: session.connecting,
-      lastEvent: session.lastEvent
-    };
-  }
-
-  res.status(200).json({
-    service: "SEM AFK BOT",
-    status: "running",
-    servers
-  });
-});
-
-const httpServer = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP server listening on port ${PORT}`);
-});
-
-// ---------- LOAD SERVER CONFIG ----------
-
+// ---------- SERVER CONFIG ----------
 function loadServers() {
-  let data;
+  const raw = process.env.MC_SERVERS;
+  if (!raw) throw new Error('Missing MC_SERVERS in Render Environment.');
 
+  let parsed;
   try {
-    data = JSON.parse(process.env.MC_SERVERS || "[]");
+    parsed = JSON.parse(raw);
   } catch {
-    throw new Error("MC_SERVERS must contain valid JSON.");
+    throw new Error('MC_SERVERS must be valid JSON.');
   }
 
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("Add at least one server to MC_SERVERS.");
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error('MC_SERVERS must be a non-empty JSON array.');
   }
 
-  for (const config of data) {
-    if (
-      !config.id ||
-      !/^[a-zA-Z0-9_-]+$/.test(config.id) ||
-      !config.host ||
-      !config.username
-    ) {
-      throw new Error(
-        "Each server needs a valid id, host and username."
-      );
+  serverConfigs.clear();
+  for (const item of parsed) {
+    if (!item || !item.id || !item.host || !item.username) {
+      throw new Error('Each MC_SERVERS item needs id, host, and username.');
     }
-
-    const port = Number(config.port || 25565);
-
+    const id = String(item.id).trim();
+    const port = Number(item.port || 25565);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error(`Invalid port for server ${config.id}.`);
+      throw new Error(`Invalid port for server "${id}".`);
     }
-
-    if (serverConfigs.has(config.id)) {
-      throw new Error(`Duplicate server ID: ${config.id}`);
-    }
-
-    serverConfigs.set(config.id, {
-      id: config.id,
-      host: config.host,
+    serverConfigs.set(id, {
+      id,
+      host: String(item.host).trim(),
       port,
-      username: config.username
-    });
-
-    sessions.set(config.id, {
-      bot: null,
-      connecting: false,
-      sneaking: false,
-      lastEvent: "Not connected",
-      walkTimer: null,
-      jumpTimer: null
+      username: String(item.username).trim(),
+      version: item.version ? String(item.version).trim() : undefined
     });
   }
-}
-
-// ---------- ADMIN CHECK ----------
-
-function isAdmin(msg) {
-  return Boolean(
-    ADMIN_ID &&
-    msg.from &&
-    String(msg.from.id) === String(ADMIN_ID)
-  );
-}
-
-function reply(msg, text) {
-  return telegram.sendMessage(msg.chat.id, text)
-    .catch(err => {
-      console.error("Telegram send error:", err.message);
-    });
 }
 
 function getSession(id) {
-  return sessions.get(id);
+  return sessions.get(String(id));
 }
 
-function getBot(id) {
-  return getSession(id)?.bot || null;
+function isConnected(session) {
+  return Boolean(session && session.bot && session.bot.entity);
 }
 
-function isConnected(id) {
-  return Boolean(getBot(id)?.entity);
+function send(chatId, message) {
+  if (!telegram) return;
+  telegram.sendMessage(chatId, message, { disable_web_page_preview: true })
+    .catch(err => console.error('Telegram send error:', err.message));
 }
 
-// ---------- MOVEMENT HELPERS ----------
-
-function stopMovement(id) {
+function leaveServer(id) {
   const session = getSession(id);
-  if (!session) return;
+  if (!session) return false;
 
-  if (session.walkTimer) {
-    clearTimeout(session.walkTimer);
-    session.walkTimer = null;
-  }
-
-  if (session.jumpTimer) {
-    clearTimeout(session.jumpTimer);
-    session.jumpTimer = null;
-  }
-
-  if (session.bot) {
-    session.bot.clearControlStates();
-
-    try {
-      session.bot.pathfinder.setGoal(null);
-    } catch (_) {}
-  }
-
-  session.sneaking = false;
-}
-
-function jump(id) {
-  const session = getSession(id);
-  const bot = getBot(id);
-
-  if (!session || !bot?.entity) {
-    return "Bot is not connected.";
-  }
-
-  if (session.jumpTimer) clearTimeout(session.jumpTimer);
-
-  bot.setControlState("jump", true);
-
-  session.jumpTimer = setTimeout(() => {
-    if (session.bot === bot) {
-      bot.setControlState("jump", false);
-    }
-    session.jumpTimer = null;
-  }, 350);
-
-  return "Jump requested.";
-}
-
-function toggleSneak(id) {
-  const session = getSession(id);
-  const bot = getBot(id);
-
-  if (!session || !bot?.entity) {
-    return "Bot is not connected.";
-  }
-
-  session.sneaking = !session.sneaking;
-
-  bot.setControlState("sneak", session.sneaking);
-
-  return session.sneaking
-    ? "Sneak enabled."
-    : "Sneak disabled.";
-}
-
-function walk(id) {
-  const session = getSession(id);
-  const bot = getBot(id);
-
-  if (!session || !bot?.entity) {
-    return "Bot is not connected.";
-  }
-
-  stopMovement(id);
-
-  bot.setControlState("forward", true);
-
-  session.walkTimer = setTimeout(() => {
-    if (session.bot === bot) {
-      bot.setControlState("forward", false);
-    }
-
-    session.walkTimer = null;
-  }, 2000);
-
-  return "Walking forward for 2 seconds.";
-}
-
-function moveToCoordinates(id, x, y, z) {
-  const bot = getBot(id);
-
-  if (!bot?.entity) {
-    return "Bot is not connected.";
-  }
-
-  if (!bot.pathfinder) {
-    return "Pathfinder is not ready yet.";
-  }
-
-  const values = [x, y, z];
-
-  if (
-    !values.every(Number.isSafeInteger) ||
-    values.some(n => Math.abs(n) > 30000000) ||
-    y < -2048 ||
-    y > 2048
-  ) {
-    return "Invalid coordinates.";
-  }
-
+  sessions.delete(String(id));
   try {
-    stopMovement(id);
-
-    bot.pathfinder.setGoal(new GoalBlock(x, y, z));
-
-    return `Pathfinding towards ${x} ${y} ${z}.`;
+    if (session.bot) {
+      session.bot.removeAllListeners();
+      session.bot.quit('Disconnected by admin');
+    }
   } catch (err) {
-    return `Movement error: ${err.message}`;
+    console.error(`Error disconnecting ${id}:`, err.message);
   }
+  return true;
 }
 
-// ---------- CONNECT TO A SERVER ----------
-
-function joinServer(id) {
-  const config = serverConfigs.get(id);
-  const session = getSession(id);
-
-  if (!config || !session) {
-    return `Unknown server: ${id}. Use /servers.`;
+// ---------- MINECRAFT CONNECTION ----------
+function joinServer(id, chatId) {
+  const config = serverConfigs.get(String(id));
+  if (!config) {
+    send(chatId, `❌ Unknown server ID: ${id}\nUse /servers to see configured servers.`);
+    return;
   }
 
-  if (session.connecting || session.bot) {
-    return `${id}: already connected or connecting.`;
+  if (sessions.has(config.id)) {
+    const old = sessions.get(config.id);
+    if (old.connecting || isConnected(old)) {
+      send(chatId, `ℹ️ Bot is already connecting to or connected with "${config.id}".`);
+      return;
+    }
+    leaveServer(config.id);
   }
 
-  session.connecting = true;
-  session.lastEvent = "Connection requested";
+  const session = { bot: null, connecting: true, startedAt: Date.now(), config };
+  sessions.set(config.id, session);
+  send(chatId, `🔄 Connecting to ${config.id} (${config.host}:${config.port}) as ${config.username}...`);
 
   let bot;
-
   try {
     bot = mineflayer.createBot({
       host: config.host,
       port: config.port,
       username: config.username,
-      auth: "offline",
-      hideErrors: false
+      auth: 'offline',
+      ...(config.version ? { version: config.version } : {})
     });
-
-    session.bot = bot;
-
-    bot.loadPlugin(pathfinder);
-
-    bot.once("login", () => {
-      if (session.bot !== bot) return;
-
-      session.connecting = false;
-      session.lastEvent = "Logged in";
-
-      console.log(`[${id}] Login successful`);
-    });
-
-    bot.once("spawn", () => {
-      if (session.bot !== bot) return;
-
-      session.connecting = false;
-      session.lastEvent = "Spawned in world";
-
-      try {
-        bot.pathfinder.setMovements(new Movements(bot));
-      } catch (err) {
-        console.error(`[${id}] Pathfinder:`, err.message);
-      }
-
-      console.log(`[${id}] Spawned in world`);
-    });
-
-    bot.on("kicked", reason => {
-      if (session.bot !== bot) return;
-
-      session.lastEvent =
-        "Kicked: " + String(reason).slice(0, 180);
-
-      console.log(`[${id}] ${session.lastEvent}`);
-    });
-
-    bot.on("error", err => {
-      if (session.bot !== bot) return;
-
-      session.lastEvent = "Error: " + err.message;
-      console.error(`[${id}]`, err.message);
-    });
-
-    bot.on("end", () => {
-      if (session.bot !== bot) return;
-
-      stopMovement(id);
-      session.bot = null;
-      session.connecting = false;
-      session.lastEvent = "Disconnected";
-
-      console.log(`[${id}] Disconnected`);
-    });
-
-    return `${id}: connection attempt started.`;
   } catch (err) {
-    if (session.bot === bot) session.bot = null;
+    sessions.delete(config.id);
+    send(chatId, `❌ Could not start connection: ${err.message}`);
+    return;
+  }
 
+  session.bot = bot;
+  bot.loadPlugin(pathfinder);
+
+  bot.once('login', () => {
     session.connecting = false;
-    session.lastEvent = "Error: " + err.message;
+    console.log(`[${config.id}] Logged in as ${config.username}`);
+  });
 
-    return `${id}: ${session.lastEvent}`;
-  }
-}
+  bot.once('spawn', () => {
+    session.connecting = false;
+    try {
+      const mcData = require('minecraft-data')(bot.version);
+      bot.pathfinder.setMovements(new Movements(bot, mcData));
+    } catch (err) {
+      console.error(`[${config.id}] Pathfinder setup:`, err.message);
+    }
+    send(chatId, `✅ Minecraft bot joined "${config.id}" successfully.`);
+  });
 
-// ---------- DISCONNECT ----------
+  bot.on('kicked', reason => {
+    console.log(`[${config.id}] Kicked:`, reason);
+    send(chatId, `⚠️ Minecraft bot "${config.id}" was kicked: ${String(reason).slice(0, 500)}`);
+  });
 
-function leaveServer(id) {
-  const session = getSession(id);
+  bot.on('error', err => {
+    console.error(`[${config.id}] Minecraft error:`, err.message);
+    send(chatId, `❌ Minecraft error on "${config.id}": ${err.message}`);
+  });
 
-  if (!session) {
-    return `Unknown server: ${id}. Use /servers.`;
-  }
-
-  const bot = session.bot;
-
-  if (!bot) {
-    return `${id}: not connected.`;
-  }
-
-  stopMovement(id);
-
-  session.bot = null;
-  session.connecting = false;
-  session.lastEvent = "Disconnected by admin";
-
-  try {
-    bot.quit("Owner requested disconnect");
-  } catch (err) {
-    console.error(`[${id}] Disconnect error:`, err.message);
-  }
-
-  return `${id}: disconnected.`;
-}
-
-// ---------- STATUS ----------
-
-function statusText(id) {
-  const session = getSession(id);
-
-  if (!session) return `Unknown server: ${id}.`;
-
-  return [
-    `🎮 Server: ${id}`,
-    `Connection: ${isConnected(id) ? "ONLINE" : "OFFLINE"}`,
-    `Connecting: ${session.connecting ? "YES" : "NO"}`,
-    `Last event: ${session.lastEvent}`
-  ].join("\n");
-}
-
-function allStatuses() {
-  if (sessions.size === 0) return "No servers configured.";
-
-  return [...sessions.keys()]
-    .map(id => statusText(id))
-    .join("\n\n");
+  bot.on('end', reason => {
+    console.log(`[${config.id}] Connection ended: ${reason || 'unknown reason'}`);
+    if (sessions.get(config.id) === session) sessions.delete(config.id);
+    send(chatId, `🔌 Minecraft bot "${config.id}" disconnected.`);
+  });
 }
 
 // ---------- TELEGRAM COMMANDS ----------
-
 function registerCommands() {
   telegram.onText(/^\/start(?:@\w+)?$/, msg => {
-    if (!isAdmin(msg)) return;
-
-    reply(
-      msg,
-      [
-        "💜 SEM AFK BOT",
-        "",
-        "/servers",
-        "/status",
-        "/status <id>",
-        "/join <id>",
-        "/leave <id>",
-        "/jump <id>",
-        "/sneak <id>",
-        "/walk <id>",
-        "/stop <id>",
-        "/tp <id> <x> <y> <z>",
-        "/kill <id>",
-        "",
-        "Example: /join survival"
-      ].join("\n")
+    if (String(msg.chat.id) !== ADMIN_ID) {
+      return send(msg.chat.id, '⛔ This bot is private. Ask the owner for access.');
+    }
+    send(msg.chat.id,
+      '👋 SEM-AFK-BOT ready!\n\n' +
+      '/servers — configured servers\n' +
+      '/status — bot connection status\n' +
+      '/join <id> — join a server\n' +
+      '/leave <id> — disconnect from a server\n' +
+      '/jump <id> — jump\n' +
+      '/sneak <id> — toggle sneak\n' +
+      '/walk <id> — walk forward briefly\n' +
+      '/stop <id> — stop movement\n' +
+      '/tp <id> <x> <y> <z> — walk to coordinates\n' +
+      '/kill <id> — disconnect bot from server'
     );
+  });
+
+  telegram.on('message', msg => {
+    if (!msg.text || !msg.text.startsWith('/')) return;
+    if (String(msg.chat.id) !== ADMIN_ID) {
+      send(msg.chat.id, '⛔ Only the configured admin can use commands.');
+    }
   });
 
   telegram.onText(/^\/servers(?:@\w+)?$/, msg => {
-    if (!isAdmin(msg)) return;
-
-    const list = [...serverConfigs.values()].map(s =>
-      `${s.id} — ${s.host}:${s.port}`
-    );
-
-    reply(msg, list.join("\n") || "No servers configured.");
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const lines = [...serverConfigs.values()].map(s =>
+      `• ${s.id}: ${s.host}:${s.port} (username: ${s.username})`);
+    send(msg.chat.id, lines.length ? `🗂 Configured servers:\n${lines.join('\n')}` : 'No servers configured.');
   });
 
-  telegram.onText(/^\/status(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
+  telegram.onText(/^\/status(?:@\w+)?$/, msg => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const lines = [...serverConfigs.keys()].map(id => {
+      const s = getSession(id);
+      const status = !s ? '🔴 Disconnected' : isConnected(s) ? '🟢 Connected' : '🟡 Connecting';
+      return `• ${id}: ${status}`;
+    });
+    send(msg.chat.id, `📊 SEM-AFK-BOT status\n${lines.join('\n') || 'No servers configured.'}`);
+  });
 
+  telegram.onText(/^\/join(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    joinServer(match[1], msg.chat.id);
+  });
+
+  telegram.onText(/^\/leave(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
     const id = match[1];
-
-    if (id) {
-      reply(msg, statusText(id));
-    } else {
-      reply(msg, allStatuses());
-    }
+    if (!leaveServer(id)) return send(msg.chat.id, `ℹ️ No active session for "${id}".`);
+    send(msg.chat.id, `🔌 Disconnected "${id}".`);
   });
 
-  telegram.onText(/^\/join(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
+  telegram.onText(/^\/kill(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
     const id = match[1];
-
-    if (!id) {
-      reply(msg, "Usage: /join <server_id>");
-      return;
-    }
-
-    reply(msg, joinServer(id));
+    if (!leaveServer(id)) return send(msg.chat.id, `ℹ️ No active session for "${id}".`);
+    send(msg.chat.id, `🛑 Bot "${id}" disconnected.`);
   });
 
-  telegram.onText(/^\/leave(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    if (!match[1]) {
-      reply(msg, "Usage: /leave <server_id>");
-      return;
-    }
-
-    reply(msg, leaveServer(match[1]));
+  telegram.onText(/^\/jump(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const s = getSession(match[1]);
+    if (!isConnected(s)) return send(msg.chat.id, '❌ Bot is not connected. Use /join <id>.');
+    s.bot.setControlState('jump', true);
+    setTimeout(() => {
+      try { if (isConnected(s)) s.bot.setControlState('jump', false); } catch {}
+    }, 500);
+    send(msg.chat.id, `🦘 Jump command sent to "${match[1]}".`);
   });
 
-  telegram.onText(/^\/kill(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    if (!match[1]) {
-      reply(msg, "Usage: /kill <server_id>");
-      return;
-    }
-
-    reply(msg, leaveServer(match[1]));
+  telegram.onText(/^\/sneak(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const s = getSession(match[1]);
+    if (!isConnected(s)) return send(msg.chat.id, '❌ Bot is not connected. Use /join <id>.');
+    const next = !s.bot.getControlState('sneak');
+    s.bot.setControlState('sneak', next);
+    send(msg.chat.id, `🕵️ Sneak ${next ? 'enabled' : 'disabled'} for "${match[1]}".`);
   });
 
-  telegram.onText(/^\/jump(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    if (!match[1]) {
-      reply(msg, "Usage: /jump <server_id>");
-      return;
-    }
-
-    reply(msg, jump(match[1]));
+  telegram.onText(/^\/walk(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const s = getSession(match[1]);
+    if (!isConnected(s)) return send(msg.chat.id, '❌ Bot is not connected. Use /join <id>.');
+    s.bot.setControlState('forward', true);
+    setTimeout(() => {
+      try { if (isConnected(s)) s.bot.setControlState('forward', false); } catch {}
+    }, 3000);
+    send(msg.chat.id, `🚶 Walking forward for 3 seconds on "${match[1]}".`);
   });
 
-  telegram.onText(/^\/sneak(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    if (!match[1]) {
-      reply(msg, "Usage: /sneak <server_id>");
-      return;
-    }
-
-    reply(msg, toggleSneak(match[1]));
+  telegram.onText(/^\/stop(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const s = getSession(match[1]);
+    if (!isConnected(s)) return send(msg.chat.id, '❌ Bot is not connected.');
+    s.bot.clearControlStates();
+    s.bot.pathfinder.setGoal(null);
+    send(msg.chat.id, `⏹️ Movement stopped for "${match[1]}".`);
   });
 
-  telegram.onText(/^\/walk(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    if (!match[1]) {
-      reply(msg, "Usage: /walk <server_id>");
-      return;
-    }
-
-    reply(msg, walk(match[1]));
+  telegram.onText(/^\/tp(?:@\w+)?\s+(\S+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)$/, (msg, match) => {
+    if (String(msg.chat.id) !== ADMIN_ID) return;
+    const [, id, xRaw, yRaw, zRaw] = match;
+    const s = getSession(id);
+    if (!isConnected(s)) return send(msg.chat.id, '❌ Bot is not connected. Use /join <id>.');
+    const x = Number(xRaw), y = Number(yRaw), z = Number(zRaw);
+    if (![x, y, z].every(Number.isFinite)) return send(msg.chat.id, '❌ Coordinates are invalid.');
+    s.bot.pathfinder.setGoal(new goals.GoalBlock(Math.floor(x), Math.floor(y), Math.floor(z)));
+    send(msg.chat.id, `📍 "${id}" is pathfinding toward ${x}, ${y}, ${z}. (This is walking, not instant teleportation.)`);
   });
 
-  telegram.onText(/^\/stop(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
-    if (!isAdmin(msg)) return;
-
-    const id = match[1];
-    const session = getSession(id);
-
-    if (!id || !session) {
-      reply(msg, "Usage: /stop <server_id>");
-      return;
-    }
-
-    stopMovement(id);
-    reply(msg, `${id}: movement stopped.`);
-  });
-
-  telegram.onText(
-    /^\/tp(?:@\w+)?\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)$/,
-    (msg, match) => {
-      if (!isAdmin(msg)) return;
-
-      const [, id, x, y, z] = match;
-
-      reply(
-        msg,
-        moveToCoordinates(id, Number(x), Number(y), Number(z))
-      );
-    }
-  );
-
-  telegram.on("polling_error", err => {
-    console.error("Telegram polling error:", err.message);
+  telegram.on('polling_error', err => {
+    console.error('Telegram polling error:', err.message);
   });
 }
 
+// ---------- STARTUP ----------
+function start() {
+  if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN in Render Environment.');
+  if (!ADMIN_ID) throw new Error('Missing ADMIN_CHAT_ID in Render Environment.');
 
- https://sem-minecraft-afk-bot.onrender.com
+  loadServers();
+  telegram = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+  registerCommands();
 
-
+  console.log('Telegram polling enabled.');
   console.log(`Loaded ${serverConfigs.size} Minecraft server(s).`);
+}
+
+try {
+  start();
 } catch (err) {
-  console.error("Startup configuration error:", err.message);
+  console.error('Startup configuration error:', err.message);
 }
 
 // ---------- GRACEFUL SHUTDOWN ----------
-
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  for (const id of sessions.keys()) {
-    leaveServer(id);
-  }
+  for (const id of [...sessions.keys()]) leaveServer(id);
 
   if (telegram) {
-    telegram.stopPolling()
-      .catch(err => console.error("Polling shutdown:", err.message));
+    try {
+      const result = telegram.stopPolling();
+      if (result && typeof result.catch === 'function') {
+        result.catch(err => console.error('Polling shutdown:', err.message));
+      }
+    } catch (err) {
+      console.error('Polling shutdown:', err.message);
+    }
   }
 
   httpServer.close(() => process.exit(0));
-
   setTimeout(() => process.exit(0), 5000).unref();
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-                    
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
