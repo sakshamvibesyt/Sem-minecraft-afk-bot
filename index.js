@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const mineflayer = require('mineflayer');
+const mineflayer = require('@wp2508/mineflayer');
 const TelegramBot = require('node-telegram-bot-api');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 
