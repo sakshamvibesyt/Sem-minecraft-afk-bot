@@ -555,30 +555,7 @@ function registerCommands() {
 }
 
 
- // ---------- STARTUP ----------
-
-try {
-  if (!TELEGRAM_TOKEN) {
-    throw new Error("Missing TELEGRAM_BOT_TOKEN in Render Environment.");
-  }
-
-  if (!ADMIN_ID) {
-    throw new Error("Missing ADMIN_CHAT_ID in Render Environment.");
-  }
-
-  loadServers();
-
-  telegram = new TelegramBot(TELEGRAM_TOKEN, {
-    polling: true
-  });
-
-  registerCommands();
-
-  console.log("Telegram polling enabled.");
-  console.log(`Loaded ${serverConfigs.size} Minecraft server(s).`);
-} catch (err) {
-  console.error("Startup configuration error:", err.message);
-}
+ https://sem-minecraft-afk-bot.onrender.com
 
 
   console.log(`Loaded ${serverConfigs.size} Minecraft server(s).`);
