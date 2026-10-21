@@ -1,0 +1,16 @@
+
+{
+  "name": "sem-afk-bot",
+  "version": "2.0.0",
+  "description": "SEM Minecraft Multi-Server Telegram Controller",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mineflayer": "^4.32.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
