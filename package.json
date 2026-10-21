@@ -1,20 +1,16 @@
+
 {
   "name": "sem-afk-bot",
-  "version": "2.1.0",
-  "description": "Telegram-controlled Mineflayer bot for multiple Minecraft Java servers",
+  "version": "1.0.0",
+  "description": "Telegram controlled Minecraft AFK bot",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
-    "express": "^5.1.0",
-    "minecraft-data": "^3.95.0",
-    "mineflayer": "^4.32.0",
-    "mineflayer-pathfinder": "^2.4.5",
-    "node-telegram-bot-api": "^0.66.0"
+    "express": "^4.21.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "@wp2508/mineflayer": "latest",
+    "mineflayer-pathfinder": "^2.4.5"
   }
 }
